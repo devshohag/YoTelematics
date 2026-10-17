@@ -1,0 +1,6 @@
+@YoTelematics.WebApi_HostAddress = http://localhost:5283
+
+GET {{YoTelematics.WebApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

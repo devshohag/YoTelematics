@@ -1,0 +1,18 @@
+﻿## .NET & IDE
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+appsettings.Development.json
+*.log
+
+## Docker Volumes
+.containers/
+pgdata/
+redisdata/
+rabbitmqdata/

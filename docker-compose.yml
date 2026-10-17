@@ -1,0 +1,59 @@
+﻿services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    container_name: yotelematics-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: yotelematics_db
+      POSTGRES_USER: yoadmin
+      POSTGRES_PASSWORD: YoStrongPassword2026!
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/home/postgres/pgdata/data
+      - ./docker/postgres/001-init-extensions-and-roles.sql:/docker-entrypoint-initdb.d/001-init-extensions-and-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yoadmin -d yotelematics_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: yotelematics-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: yotelematics-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: yoguest
+      RABBITMQ_DEFAULT_PASS: YoRabbitPass2026!
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitmqdata:

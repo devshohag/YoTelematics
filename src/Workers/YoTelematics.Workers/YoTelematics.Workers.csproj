@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-YoTelematics.Workers-6871c3c3-99f1-4516-912a-07046760f52d</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Core\YoTelematics.Application\YoTelematics.Application.csproj" />
+    <ProjectReference Include="..\..\Core\YoTelematics.Infrastructure\YoTelematics.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\Core\YoTelematics.Rules.Bike\YoTelematics.Rules.Bike.csproj" />
+  </ItemGroup>
+</Project>

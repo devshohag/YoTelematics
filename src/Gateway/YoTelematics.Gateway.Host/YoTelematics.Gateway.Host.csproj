@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-YoTelematics.Gateway.Host-0d52f18a-8888-4b3f-b8c1-22887cfac02b</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\YoTelematics.Protocols.Abstractions\YoTelematics.Protocols.Abstractions.csproj" />
+    <ProjectReference Include="..\YoTelematics.Protocols.Gt06\YoTelematics.Protocols.Gt06.csproj" />
+    <ProjectReference Include="..\..\Core\YoTelematics.Infrastructure\YoTelematics.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>
