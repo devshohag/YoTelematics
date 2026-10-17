@@ -1,5 +1,7 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.AspNetCore.DataProtection;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using YoTelematics.Application.Common;
 using YoTelematics.Infrastructure.Persistence;
 
@@ -7,25 +9,33 @@ namespace YoTelematics.Infrastructure;
 
 public static class InfrastructureServiceExtensions
 {
-    public static IServiceCollection AddYoTelematicsPersistence(
+    public static IServiceCollection AddYoTelematicsInfrastructure(
         this IServiceCollection services,
         string appConnectionString)
     {
-        if (appConnectionString.Contains("No Reset On Close=true", StringComparison.OrdinalIgnoreCase) ||
-            appConnectionString.Contains("NoResetOnClose=true", StringComparison.OrdinalIgnoreCase))
+        var builder = new NpgsqlConnectionStringBuilder(appConnectionString);
+        if (builder.NoResetOnClose)
         {
             throw new InvalidOperationException(
-                "Security violation (v3.4-FINAL): 'No Reset On Close=true' is strictly prohibited on RLS-protected connections.");
+                "SECURITY VIOLATION: 'No Reset On Close=true' is strictly forbidden with RLS.");
         }
 
-        services.AddSingleton<ITenantContextAccessor, TenantContextAccessor>();
-        services.AddSingleton<TenantRlsConnectionInterceptor>();
+        services.AddScoped<TenantRlsConnectionInterceptor>();
 
         services.AddDbContext<YoTelematicsDbContext>((sp, options) =>
         {
-            options.UseNpgsql(appConnectionString, npgsql => npgsql.UseNetTopologySuite());
-            options.AddInterceptors(sp.GetRequiredService<TenantRlsConnectionInterceptor>());
+            var rlsInterceptor = sp.GetRequiredService<TenantRlsConnectionInterceptor>();
+            options.UseNpgsql(appConnectionString, npgsql =>
+            {
+                npgsql.UseNetTopologySuite();
+            })
+            .AddInterceptors(rlsInterceptor);
         });
+
+        // Blocker B7 Fix: Persist DataProtection Key Ring to PostgreSQL data_protection_keys table
+        services.AddDataProtection()
+            .SetApplicationName("YoTelematics")
+            .PersistKeysToDbContext<YoTelematicsDbContext>();
 
         return services;
     }

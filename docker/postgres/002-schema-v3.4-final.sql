@@ -1,14 +1,8 @@
--- =============================================================================
--- YoTelematics v3.4-FINAL Master Schema, Hypertables, Ledger Trigger & Forced RLS
+﻿-- =============================================================================
+-- YoTelematics v3.4-FINAL Database Schema (With P1-Fix Items #9 & #10)
 -- =============================================================================
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "postgis";
-CREATE EXTENSION IF NOT EXISTS "timescaledb";
-CREATE EXTENSION IF NOT EXISTS "ltree";
-CREATE EXTENSION IF NOT EXISTS "btree_gist";
-
--- 1. DATA PROTECTION KEY RING
+-- 1. DATA PROTECTION KEY RING (Blocker B7)
 CREATE TABLE IF NOT EXISTS data_protection_keys (
     id SERIAL PRIMARY KEY,
     friendly_name TEXT,
@@ -49,7 +43,7 @@ CREATE TABLE IF NOT EXISTS tenant_provider_configs (
     UNIQUE(tenant_id, provider_type)
 );
 
--- 3. ORGANIZATIONS, BRANCHES, USERS (Nullable Password), PUSH & OTP (with tenant_id)
+-- 3. ORGANIZATIONS, BRANCHES, USERS, PUSH & OTP
 CREATE TABLE IF NOT EXISTS organizations (
     id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id),
@@ -102,7 +96,7 @@ CREATE TABLE IF NOT EXISTS otp_challenges (
     created_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 4. DEVICE MODELS (with status_response_regex) & INVENTORY
+-- 4. DEVICE MODELS & INVENTORY
 CREATE TABLE IF NOT EXISTS device_models (
     id VARCHAR(32) PRIMARY KEY,
     protocol VARCHAR(24) NOT NULL,
@@ -144,14 +138,14 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
     moved_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 5. ASSETS & PROFILES (with auto_arm_due_at_utc, safety_state & watch_contacts)
+-- 5. ASSETS (With Reviewer Item #10 Category CHECK Constraint) & PROFILES
 CREATE TABLE IF NOT EXISTS assets (
     id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id),
     branch_id UUID REFERENCES branches(id),
     origin_dealer_id UUID REFERENCES users(id),
     current_imei VARCHAR(15) UNIQUE REFERENCES inventory_devices(imei),
-    category VARCHAR(16) NOT NULL,
+    category VARCHAR(16) NOT NULL CHECK (category IN ('BIKE', 'CAR', 'BUS', 'TRUCK', 'KID', 'PET')),
     name VARCHAR(100) NOT NULL,
     identifier_label VARCHAR(40),
     state_version BIGINT NOT NULL DEFAULT 1,
@@ -308,6 +302,7 @@ CREATE TABLE IF NOT EXISTS security_audit_logs (
     details_jsonb JSONB NOT NULL DEFAULT '{}',
     created_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+REVOKE UPDATE, DELETE, TRUNCATE ON security_audit_logs FROM yoapp_user, yoworker_service;
 
 -- 8. HYPERTABLES WITH PK (asset_id, device_timestamp_utc, packet_type)
 CREATE TABLE IF NOT EXISTS telemetry_history (
@@ -396,16 +391,18 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 CREATE OR REPLACE FUNCTION check_ledger_transaction_balanced() RETURNS TRIGGER AS $$
 DECLARE
     v_diff NUMERIC(12,2);
+    v_tx_id UUID;
 BEGIN
+    v_tx_id := COALESCE(NEW.transaction_id, OLD.transaction_id);
     SELECT COALESCE(SUM(debit), 0) - COALESCE(SUM(credit), 0)
     INTO v_diff
     FROM ledger_entries
-    WHERE transaction_id = COALESCE(NEW.transaction_id, OLD.transaction_id);
+    WHERE transaction_id = v_tx_id;
 
     IF v_diff <> 0 THEN
-        RAISE EXCEPTION 'Unbalanced ledger transaction %: net difference is %', COALESCE(NEW.transaction_id, OLD.transaction_id), v_diff;
+        RAISE EXCEPTION 'Unbalanced ledger transaction %: net difference is %', v_tx_id, v_diff;
     END IF;
-    RETURN NEW;
+    RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -415,43 +412,43 @@ AFTER INSERT OR UPDATE OR DELETE ON ledger_entries
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION check_ledger_transaction_balanced();
 
--- 10. FAIL-CLOSED RLS POLICY ACROSS ALL 26 TENANT OLTP TABLES (NULLIF Guard)
+-- 10. FAIL-CLOSED RLS POLICY ACROSS ALL TENANT OLTP TABLES + GEOFENCE WIFI FINGERPRINTS (Item #9)
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenants FORCE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_policy ON tenants;
-CREATE POLICY tenant_isolation_policy ON tenants
-    USING (hierarchy_path <@ NULLIF(current_setting('app.current_tenant_path', true), '')::ltree)
-    WITH CHECK (hierarchy_path <@ NULLIF(current_setting('app.current_tenant_path', true), '')::ltree);
+DROP POLICY IF EXISTS tenant_isolation_tenants ON tenants;
+CREATE POLICY tenant_isolation_tenants ON tenants
+    USING (hierarchy_path <@ NULLIF(current_setting('app.current_tenant_path', true), '')::ltree);
 
 DO $$
 DECLARE
-    tbl TEXT;
+    t_name TEXT;
     oltp_tables TEXT[] := ARRAY[
         'tenant_holidays', 'tenant_provider_configs', 'organizations', 'branches',
         'users', 'user_push_tokens', 'otp_challenges', 'inventory_devices',
         'inventory_movements', 'assets', 'asset_members', 'vehicle_profiles',
-        'driver_schedules', 'person_pet_profiles', 'watch_contacts', 'asset_device_swaps',
-        'geofences', 'child_schedules', 'geofence_holidays', 'device_commands',
-        'security_audit_logs', 'commission_rates', 'ledger_accounts',
-        'ledger_transactions', 'ledger_entries'
+        'driver_schedules', 'person_pet_profiles', 'watch_contacts',
+        'asset_device_swaps', 'geofences', 'child_schedules',
+        'geofence_holidays', 'device_commands', 'security_audit_logs',
+        'commission_rates', 'ledger_accounts', 'ledger_transactions', 'ledger_entries'
     ];
 BEGIN
-    FOREACH tbl IN ARRAY oltp_tables
+    FOREACH t_name IN ARRAY oltp_tables
     LOOP
-        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', tbl);
-        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', tbl);
-        EXECUTE format('DROP POLICY IF EXISTS tenant_isolation_policy ON %I;', tbl);
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', t_name);
+        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', t_name);
+        EXECUTE format('DROP POLICY IF EXISTS tenant_isolation_%I ON %I;', t_name, t_name);
         EXECUTE format(
-            'CREATE POLICY tenant_isolation_policy ON %I ' ||
-            'USING (tenant_id IN (SELECT id FROM tenants WHERE hierarchy_path <@ NULLIF(current_setting(''app.current_tenant_path'', true), '''')::ltree)) ' ||
-            'WITH CHECK (tenant_id IN (SELECT id FROM tenants WHERE hierarchy_path <@ NULLIF(current_setting(''app.current_tenant_path'', true), '''')::ltree));',
-            tbl
+            'CREATE POLICY tenant_isolation_%I ON %I USING (tenant_id IN (SELECT id FROM tenants WHERE hierarchy_path <@ NULLIF(current_setting(''app.current_tenant_path'', true), '''')::ltree));',
+            t_name, t_name
         );
     END LOOP;
 END
 $$;
 
--- 11. GRANT TABLE PERMISSIONS & ENFORCE AUDIT LOG IMMUTABILITY
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO yoapp_user, yoworker_service;
-GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO yoapp_user, yoworker_service;
-REVOKE UPDATE, DELETE, TRUNCATE ON security_audit_logs FROM yoapp_user, yoworker_service;
+-- Reviewer Item #9: RLS on geofence_wifi_fingerprints via geofences parent table
+ALTER TABLE geofence_wifi_fingerprints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE geofence_wifi_fingerprints FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_geofence_wifi_fingerprints ON geofence_wifi_fingerprints;
+CREATE POLICY tenant_isolation_geofence_wifi_fingerprints ON geofence_wifi_fingerprints
+    USING (geofence_id IN (SELECT id FROM geofences))
+    WITH CHECK (geofence_id IN (SELECT id FROM geofences));

@@ -13,6 +13,7 @@
     volumes:
       - pgdata:/home/postgres/pgdata/data
       - ./docker/postgres/001-init-extensions-and-roles.sql:/docker-entrypoint-initdb.d/001-init-extensions-and-roles.sql:ro
+      - ./docker/postgres/002-schema-v3.4-final.sql:/docker-entrypoint-initdb.d/002-schema-v3.4-final.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U yoadmin -d yotelematics_db"]
       interval: 5s
