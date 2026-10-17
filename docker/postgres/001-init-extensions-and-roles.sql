@@ -1,0 +1,26 @@
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "postgis";
+CREATE EXTENSION IF NOT EXISTS "timescaledb";
+CREATE EXTENSION IF NOT EXISTS "ltree";
+CREATE EXTENSION IF NOT EXISTS "btree_gist";
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'yoapp_user') THEN
+        CREATE ROLE yoapp_user WITH LOGIN PASSWORD 'YoAppUserPass2026!' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'yoworker_service') THEN
+        CREATE ROLE yoworker_service WITH LOGIN PASSWORD 'YoWorkerPass2026!' NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS;
+    END IF;
+END
+$$;
+
+GRANT CONNECT ON DATABASE yotelematics_db TO yoapp_user, yoworker_service;
+GRANT USAGE ON SCHEMA public TO yoapp_user, yoworker_service;
+ALTER DEFAULT PRIVILEGES FOR ROLE yoadmin IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yoapp_user, yoworker_service;
+ALTER DEFAULT PRIVILEGES FOR ROLE yoadmin IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO yoapp_user, yoworker_service;
