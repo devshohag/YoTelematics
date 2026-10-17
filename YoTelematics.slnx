@@ -1,2 +1,23 @@
 <Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/Core/">
+    <Project Path="src/Core/YoTelematics.Application/YoTelematics.Application.csproj" />
+    <Project Path="src/Core/YoTelematics.Domain/YoTelematics.Domain.csproj" />
+    <Project Path="src/Core/YoTelematics.Infrastructure/YoTelematics.Infrastructure.csproj" />
+    <Project Path="src/Core/YoTelematics.Rules.Abstractions/YoTelematics.Rules.Abstractions.csproj" />
+    <Project Path="src/Core/YoTelematics.Rules.Bike/YoTelematics.Rules.Bike.csproj" />
+    <Project Path="src/Core/YoTelematics.WebApi/YoTelematics.WebApi.csproj" />
+  </Folder>
+  <Folder Name="/src/Gateway/">
+    <Project Path="src/Gateway/YoTelematics.Gateway.Host/YoTelematics.Gateway.Host.csproj" />
+    <Project Path="src/Gateway/YoTelematics.Protocols.Abstractions/YoTelematics.Protocols.Abstractions.csproj" />
+    <Project Path="src/Gateway/YoTelematics.Protocols.Gt06/YoTelematics.Protocols.Gt06.csproj" />
+  </Folder>
+  <Folder Name="/src/Workers/">
+    <Project Path="src/Workers/YoTelematics.Workers/YoTelematics.Workers.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/YoTelematics.Tests.Integration/YoTelematics.Tests.Integration.csproj" />
+    <Project Path="tests/YoTelematics.Tests.Unit/YoTelematics.Tests.Unit.csproj" />
+  </Folder>
 </Solution>
