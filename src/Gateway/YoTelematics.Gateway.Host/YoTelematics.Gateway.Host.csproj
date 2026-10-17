@@ -14,5 +14,7 @@
   <ItemGroup>
     <ProjectReference Include="..\YoTelematics.Protocols.Abstractions\YoTelematics.Protocols.Abstractions.csproj" />
     <ProjectReference Include="..\YoTelematics.Protocols.Gt06\YoTelematics.Protocols.Gt06.csproj" />
+    <ProjectReference Include="..\..\Core\YoTelematics.Application\YoTelematics.Application.csproj" />
+    <ProjectReference Include="..\..\Core\YoTelematics.Infrastructure\YoTelematics.Infrastructure.csproj" />
   </ItemGroup>
 </Project>

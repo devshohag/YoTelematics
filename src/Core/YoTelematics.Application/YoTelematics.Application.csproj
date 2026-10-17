@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\YoTelematics.Domain\YoTelematics.Domain.csproj" />
     <ProjectReference Include="..\YoTelematics.Rules.Abstractions\YoTelematics.Rules.Abstractions.csproj" />
+    <ProjectReference Include="..\..\Gateway\YoTelematics.Protocols.Abstractions\YoTelematics.Protocols.Abstractions.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
