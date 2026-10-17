@@ -75,7 +75,10 @@ public sealed record ProtocolDecodeResult(
 public interface IProtocolDecoder
 {
     string ProtocolName { get; }
+
     ProtocolDecodeResult Decode(
         in RawPacket packet,
         DateTimeOffset? lastKnownDeviceTimestampUtc = null);
+
+    byte[] BuildCommandFrame(string asciiCommand, ushort serialNo, uint serverFlag = 1);
 }

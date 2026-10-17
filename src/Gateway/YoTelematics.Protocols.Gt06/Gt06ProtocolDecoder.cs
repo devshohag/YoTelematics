@@ -65,12 +65,15 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
             0x01 => DecodeLogin(content, serialNo, packet.ServerReceivedUtc),
             0x13 => DecodeHeartbeat(content, serialNo, packet.SessionImei, packet.ServerReceivedUtc, lastKnownDeviceTimestampUtc),
             0x12 or 0x22 => DecodeLocation(protocolNo, content, packet.SessionImei, packet.ServerReceivedUtc, lastKnownDeviceTimestampUtc),
-            0x16 or 0x26 => DecodeAlarm(content, serialNo, packet.SessionImei, packet.ServerReceivedUtc, lastKnownDeviceTimestampUtc),
+            0x16 or 0x26 => DecodeAlarm(protocolNo, content, serialNo, packet.SessionImei, packet.ServerReceivedUtc, lastKnownDeviceTimestampUtc),
             0x15 or 0x21 => DecodeCommandResponse(protocolNo, content, packet.SessionImei, packet.ServerReceivedUtc),
             0x8A => DecodeTimeSyncRequest(serialNo, packet.SessionImei, packet.ServerReceivedUtc),
             _ => Fail($"Unsupported GT06 protocol number: 0x{protocolNo:X2}")
         };
     }
+
+    public byte[] BuildCommandFrame(string asciiCommand, ushort serialNo, uint serverFlag = 1) =>
+        BuildServerCommandFrame(asciiCommand, serialNo, serverFlag);
 
     private static ProtocolDecodeResult DecodeLogin(
         ReadOnlySpan<byte> content,
@@ -211,10 +214,17 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
         bool isNorth = (courseStatus & 0x0400) != 0;
         short course = (short)(courseStatus & 0x03FF);
 
-        double lat = rawLat / 1800000.0;
-        double lon = rawLon / 1800000.0;
-        if (!isNorth) lat = -lat;
-        if (isWest) lon = -lon;
+        bool isGpsValid = isGpsPositioned && satellites >= 3 && (rawLat != 0 || rawLon != 0);
+
+        double? lat = null;
+        double? lon = null;
+        if (rawLat != 0 || rawLon != 0)
+        {
+            double dLat = rawLat / 1800000.0;
+            double dLon = rawLon / 1800000.0;
+            lat = isNorth ? dLat : -dLat;
+            lon = isWest ? -dLon : dLon;
+        }
 
         // Optional ACC byte in 0x22 4G packets (after 8-byte LBS block at index 18..25)
         bool? ignition = null;
@@ -222,8 +232,6 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
         {
             ignition = content[26] != 0x00;
         }
-
-        bool isGpsValid = isGpsPositioned && satellites >= 3;
 
         // Bug #4 Fix: MainPowerConnected is strictly null on Location packets so it never overwrites a PowerCut state
         var telemetry = new NormalizedTelemetry(
@@ -256,6 +264,7 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
     }
 
     private static ProtocolDecodeResult DecodeAlarm(
+        byte protocolNo,
         ReadOnlySpan<byte> content,
         ushort serialNo,
         string? sessionImei,
@@ -267,7 +276,7 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
             return Fail("Alarm packet received on unauthenticated session.");
         }
 
-        // 0x16 layout: 6B DateTime + 12B GPS + 9B LBS (1B len + 8B LBS) + 5B TerminalStatus/Alarm = 32 bytes min
+        // 0x16 / 0x26 layout: 6B DateTime + 12B GPS + 9B LBS (1B len + 8B LBS) + 5B TerminalStatus/Alarm = 32 bytes min
         if (content.Length < 31)
         {
             return Fail("Alarm payload too short.");
@@ -289,12 +298,19 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
         bool isNorth = (courseStatus & 0x0400) != 0;
         short course = (short)(courseStatus & 0x03FF);
 
-        double lat = rawLat / 1800000.0;
-        double lon = rawLon / 1800000.0;
-        if (!isNorth) lat = -lat;
-        if (isWest) lon = -lon;
+        bool isGpsValid = isGpsPositioned && satellites >= 3 && (rawLat != 0 || rawLon != 0);
 
-        // Status block is located in the last 5 bytes of 0x16 content:
+        double? lat = null;
+        double? lon = null;
+        if (rawLat != 0 || rawLon != 0)
+        {
+            double dLat = rawLat / 1800000.0;
+            double dLon = rawLon / 1800000.0;
+            lat = isNorth ? dLat : -dLat;
+            lon = isWest ? -dLon : dLon;
+        }
+
+        // Status block is located in the last 5 bytes of 0x16/0x26 content:
         // [TerminalInfo, VoltageLevel, GsmSignal, AlarmType, Language]
         int statusOffset = content.Length - 5;
         byte terminalInfo = content[statusOffset];
@@ -315,8 +331,8 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
             mainPowerConnected = false;
         }
 
-        bool isGpsValid = isGpsPositioned && satellites >= 3;
-        var ack = BuildStandardAck(0x16, serialNo);
+        // Uses actual protocolNo (0x16 or 0x26) so 4G trackers receive matching 0x26 ACK
+        var ack = BuildStandardAck(protocolNo, serialNo);
 
         var telemetry = new NormalizedTelemetry(
             Imei: sessionImei,
@@ -459,10 +475,6 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
         return new ProtocolDecodeResult(true, null, telemetry, frame.ToArray());
     }
 
-    /// <summary>
-    /// Fixes Bug #1 (future-only clock skew + separate IsLate/IsOutOfOrder flags)
-    /// and Bug #2 (DateTime.DaysInMonth validation preventing Feb 31 crashes).
-    /// </summary>
     private static (DateTimeOffset EffectiveUtc, bool IsClockSkewed, bool IsLate, bool IsOutOfOrder) ParseDeviceTimestamp(
         ReadOnlySpan<byte> b,
         DateTimeOffset serverNowUtc,
@@ -537,7 +549,6 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
             chars[i * 2 + 1] = (char)('0' + (bcd[i] & 0x0F));
         }
 
-        // Standard 15-digit IMEI is padded with a leading '0' in 8-byte GT06 BCD
         return chars[0] == '0'
             ? new string(chars.Slice(1, 15))
             : new string(chars.Slice(0, 15));
@@ -561,8 +572,8 @@ public sealed class Gt06ProtocolDecoder : IProtocolDecoder
     public static byte[] BuildServerCommandFrame(string asciiCommand, ushort serialNo, uint serverFlag = 1)
     {
         byte[] cmdBytes = Encoding.ASCII.GetBytes(asciiCommand);
-        int commandLengthField = 4 + cmdBytes.Length; // 4B ServerFlag + ASCII command
-        int packetLengthField = 1 + 1 + commandLengthField + 2 + 2; // Proto(1) + CmdLen(1) + CmdContent + Serial(2) + CRC(2)
+        int commandLengthField = 4 + cmdBytes.Length;
+        int packetLengthField = 1 + 1 + commandLengthField + 2 + 2;
 
         byte[] frame = new byte[2 + 1 + packetLengthField + 2];
         frame[0] = 0x78;

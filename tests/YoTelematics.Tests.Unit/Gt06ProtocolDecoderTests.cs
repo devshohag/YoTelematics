@@ -1,4 +1,5 @@
-﻿using System.Buffers.Binary;
+﻿using System.Buffers;
+using System.Buffers.Binary;
 using FluentAssertions;
 using YoTelematics.Protocols.Abstractions;
 using YoTelematics.Protocols.Gt06;
@@ -8,6 +9,7 @@ namespace YoTelematics.Tests.Unit;
 public sealed class Gt06ProtocolDecoderTests
 {
     private readonly Gt06ProtocolDecoder _decoder = new();
+    private readonly Gt06FrameDecoder _frameDecoder = new();
     private static readonly DateTimeOffset FixedServerNow = new(2026, 10, 18, 12, 0, 0, TimeSpan.Zero);
 
     [Fact]
@@ -28,7 +30,6 @@ public sealed class Gt06ProtocolDecoderTests
     [Fact]
     public void Bug1_Fix_PastBufferedPacket_10MinutesOld_PreservesOriginalDeviceTime_AndSetsIsLateWithoutClockSkew()
     {
-        // Packet recorded 10 minutes ago (11:50:00 UTC) while server is at 12:00:00 UTC
         byte[] content = BuildLocationPayload(year: 26, month: 10, day: 18, hour: 11, min: 50, sec: 0, speedKmh: 35);
         byte[] frame = BuildFrame(0x22, content, serial: 10);
         var raw = new RawPacket("GT06", 0x22, 10, frame, FixedServerNow, SessionImei: "358739051234567");
@@ -48,7 +49,6 @@ public sealed class Gt06ProtocolDecoderTests
     [Fact]
     public void Bug1_Fix_FutureClockSkew_10MinutesAhead_ClampsToServerTime_AndFlagsIsClockSkewed()
     {
-        // Faulty RTC sending 12:10:00 UTC when server is at 12:00:00 UTC
         byte[] content = BuildLocationPayload(year: 26, month: 10, day: 18, hour: 12, min: 10, sec: 0, speedKmh: 20);
         byte[] frame = BuildFrame(0x12, content, serial: 11);
         var raw = new RawPacket("GT06", 0x12, 11, frame, FixedServerNow, SessionImei: "358739051234567");
@@ -61,9 +61,9 @@ public sealed class Gt06ProtocolDecoderTests
     }
 
     [Theory]
-    [InlineData(26, 2, 31)] // Feb 31 (Invalid Day)
-    [InlineData(26, 0, 15)] // Month 0 (Invalid Month)
-    [InlineData(26, 13, 1)] // Month 13 (Invalid Month)
+    [InlineData(26, 2, 31)]
+    [InlineData(26, 0, 15)]
+    [InlineData(26, 13, 1)]
     public void Bug2_Fix_InvalidCalendarDate_DoesNotThrow_AndFallsBackToServerTimeWithSkewFlag(byte yr, byte mo, byte dy)
     {
         byte[] content = BuildLocationPayload(year: yr, month: mo, day: dy, hour: 10, min: 0, sec: 0, speedKmh: 0);
@@ -80,7 +80,6 @@ public sealed class Gt06ProtocolDecoderTests
     [Fact]
     public void Bug3_Fix_Heartbeat_0x13_DecodesBit2MainPower_Bit1Ignition_AndBit7RelayCut()
     {
-        // TerminalInfo: Bit 7 = 1 (Relay Cut), Bit 6 = 1 (GPS Track), Bit 2 = 0 (Main Power Disconnected!), Bit 1 = 0 (ACC Off)
         byte terminalInfo = 0b1100_0000;
         byte[] frame = BuildFrame(0x13, [terminalInfo, 0x04, 0x03], serial: 20);
         var raw = new RawPacket("GT06", 0x13, 20, frame, FixedServerNow, SessionImei: "358739051234567");
@@ -96,14 +95,15 @@ public sealed class Gt06ProtocolDecoderTests
         t.AlarmCode.Should().Be("alert.device.power_disconnected");
     }
 
-    [Fact]
-    public void Bug3_Fix_AlarmPacket_0x16_WithPowerCutCode_0x02_SetsPowerCutAlarmAndMainPowerFalse()
+    [Theory]
+    [InlineData(0x16)]
+    [InlineData(0x26)]
+    public void Bug3_And_4G_Alarm_Fix_AlarmPackets_0x16_And_0x26_ReturnMatchingProtocolAck_AndSetPowerCut(byte alarmProto)
     {
-        byte[] locPart = BuildLocationPayload(26, 10, 18, 11, 59, 50, speedKmh: 0); // 26 bytes
-        // Append 1B LBS length + 5B status block [TerminalInfo, Voltage, GSM, AlarmByte=0x02(PowerCut), Lang]
+        byte[] locPart = BuildLocationPayload(26, 10, 18, 11, 59, 50, speedKmh: 0);
         byte[] alarmContent = [.. locPart, 0x08, 0b0101_0000, 0x03, 0x04, 0x02, 0x01];
-        byte[] frame = BuildFrame(0x16, alarmContent, serial: 30);
-        var raw = new RawPacket("GT06", 0x16, 30, frame, FixedServerNow, SessionImei: "358739051234567");
+        byte[] frame = BuildFrame(alarmProto, alarmContent, serial: 30);
+        var raw = new RawPacket("GT06", alarmProto, 30, frame, FixedServerNow, SessionImei: "358739051234567");
 
         var result = _decoder.Decode(raw);
 
@@ -113,6 +113,25 @@ public sealed class Gt06ProtocolDecoderTests
         t.AlarmCode.Should().Be("alert.device.power_cut");
         t.MainPowerConnected.Should().BeFalse();
         result.ImmediateAckFrame.Should().NotBeNull();
+        result.ImmediateAckFrame!.Value.Span[3].Should().Be(alarmProto, "4G 0x26 alarm must receive 0x26 ACK, not 0x16");
+    }
+
+    [Fact]
+    public void FrameDecoder_Should_ResyncOverGarbageBytes_AndExtractStickyFrames()
+    {
+        byte[] frame1 = BuildFrame(0x01, [0x03, 0x58, 0x73, 0x90, 0x51, 0x23, 0x45, 0x67], serial: 1);
+        byte[] frame2 = BuildFrame(0x13, [0b0100_0110, 0x05, 0x04], serial: 2);
+        byte[] streamBytes = [0xFF, 0x00, 0x12, .. frame1, .. frame2];
+
+        var seq = new ReadOnlySequence<byte>(streamBytes);
+
+        _frameDecoder.TryReadFrame(ref seq, out var extracted1).Should().BeTrue();
+        extracted1.ToArray().Should().Equal(frame1);
+
+        _frameDecoder.TryReadFrame(ref seq, out var extracted2).Should().BeTrue();
+        extracted2.ToArray().Should().Equal(frame2);
+
+        seq.Length.Should().Be(0);
     }
 
     private static byte[] BuildLocationPayload(byte year, byte month, byte day, byte hour, byte min, byte sec, byte speedKmh)
@@ -120,11 +139,11 @@ public sealed class Gt06ProtocolDecoderTests
         byte[] buf = new byte[26];
         buf[0] = year; buf[1] = month; buf[2] = day;
         buf[3] = hour; buf[4] = min; buf[5] = sec;
-        buf[6] = 0xC9; // 9 satellites
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(7, 4), (uint)(23.7805 * 1800000)); // Dhaka Lat
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(11, 4), (uint)(90.4193 * 1800000)); // Dhaka Lon
+        buf[6] = 0xC9;
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(7, 4), (uint)(23.7805 * 1800000));
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(11, 4), (uint)(90.4193 * 1800000));
         buf[15] = speedKmh;
-        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(16, 2), 0x145A); // Positioned + North + East
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(16, 2), 0x145A);
         return buf;
     }
 
