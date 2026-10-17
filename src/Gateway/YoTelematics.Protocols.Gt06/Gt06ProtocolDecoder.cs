@@ -6,462 +6,584 @@ namespace YoTelematics.Protocols.Gt06;
 
 public sealed class Gt06ProtocolDecoder : IProtocolDecoder
 {
-    private static readonly TimeSpan MaxClockSkew = TimeSpan.FromMinutes(5);
+    public const string ProtocolId = "GT06";
+    private static readonly TimeSpan MaxFutureClockSkew = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan LatePacketThreshold = TimeSpan.FromSeconds(120);
 
-    public string ProtocolName => "GT06";
+    public string ProtocolName => ProtocolId;
 
-    public ProtocolDecodeResult DecodeFrame(
-        ReadOnlySpan<byte> frame,
-        string? sessionImei,
-        DateTimeOffset serverNowUtc,
-        DateTimeOffset? lastKnownTimestampUtc = null)
+    public ProtocolDecodeResult Decode(
+        in RawPacket packet,
+        DateTimeOffset? lastKnownDeviceTimestampUtc = null)
     {
-        if (frame.Length < 10)
+        var span = packet.Payload.Span;
+        if (span.Length < 10)
         {
-            return ProtocolDecodeResult.Fail("Frame too short");
+            return Fail("Frame too short (< 10 bytes).");
         }
 
-        bool isShortHeader = frame[0] == 0x78 && frame[1] == 0x78;
-        bool isLongHeader = frame[0] == 0x79 && frame[1] == 0x79;
-        if (!isShortHeader && !isLongHeader)
+        bool isShortHeader = span[0] == 0x78 && span[1] == 0x78;
+        bool isExtendedHeader = span[0] == 0x79 && span[1] == 0x79;
+        if (!isShortHeader && !isExtendedHeader)
         {
-            return ProtocolDecodeResult.Fail("Invalid start header bytes");
+            return Fail("Invalid start bytes (expected 0x7878 or 0x7979).");
         }
 
-        if (frame[^2] != 0x0D || frame[^1] != 0x0A)
+        if (span[^2] != 0x0D || span[^1] != 0x0A)
         {
-            return ProtocolDecodeResult.Fail("Invalid stop bytes");
+            return Fail("Invalid stop bytes (expected 0x0D0A).");
         }
 
-        int headerAndLenSize = isShortHeader ? 3 : 4;
+        int lengthFieldSize = isShortHeader ? 1 : 2;
         int declaredLength = isShortHeader
-            ? frame[2]
-            : BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(2, 2));
+            ? span[2]
+            : BinaryPrimitives.ReadUInt16BigEndian(span.Slice(2, 2));
 
-        int expectedFrameLength = headerAndLenSize + declaredLength + 2;
-        if (frame.Length != expectedFrameLength || declaredLength < 5)
+        int expectedTotalSize = 2 + lengthFieldSize + declaredLength + 2;
+        if (span.Length != expectedTotalSize)
         {
-            return ProtocolDecodeResult.Fail("Frame length mismatch");
+            return Fail($"Frame length mismatch: declared={expectedTotalSize}, actual={span.Length}.");
         }
 
         // Verify CRC-ITU over [Length .. SerialNumber]
-        ReadOnlySpan<byte> crcWindow = frame.Slice(2, headerAndLenSize - 2 + declaredLength - 2);
-        ushort expectedCrc = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(frame.Length - 4, 2));
-        ushort actualCrc = CrcItu.Compute(crcWindow);
-        if (expectedCrc != actualCrc)
+        var crcDataSlice = span.Slice(2, lengthFieldSize + declaredLength - 2);
+        ushort expectedCrc = BinaryPrimitives.ReadUInt16BigEndian(span.Slice(span.Length - 4, 2));
+        ushort calculatedCrc = CrcItu.Compute(crcDataSlice);
+
+        if (expectedCrc != calculatedCrc)
         {
-            return ProtocolDecodeResult.Fail($"CRC mismatch: expected 0x{expectedCrc:X4}, got 0x{actualCrc:X4}");
+            return Fail($"CRC-ITU mismatch: expected=0x{expectedCrc:X4}, calculated=0x{calculatedCrc:X4}.");
         }
 
-        byte protocolNumber = frame[headerAndLenSize];
-        ushort serialNumber = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(frame.Length - 6, 2));
-        ReadOnlySpan<byte> payload = frame.Slice(headerAndLenSize + 1, declaredLength - 5);
+        int protoOffset = 2 + lengthFieldSize;
+        byte protocolNo = span[protoOffset];
+        ushort serialNo = BinaryPrimitives.ReadUInt16BigEndian(span.Slice(span.Length - 6, 2));
+        var content = span.Slice(protoOffset + 1, declaredLength - 5);
 
-        return protocolNumber switch
+        return protocolNo switch
         {
-            0x01 => DecodeLogin(payload, serialNumber, serverNowUtc),
-            0x13 => DecodeHeartbeat(payload, sessionImei, serialNumber, serverNowUtc),
-            0x12 or 0x22 => DecodeLocation(protocolNumber, payload, sessionImei, serverNowUtc, lastKnownTimestampUtc),
-            0x16 or 0x26 => DecodeAlarm(protocolNumber, payload, sessionImei, serialNumber, serverNowUtc, lastKnownTimestampUtc),
-            0x15 or 0x21 => DecodeCommandResponse(protocolNumber, payload, sessionImei, serverNowUtc),
-            _ => ProtocolDecodeResult.Fail($"Unsupported GT06 protocol number 0x{protocolNumber:X2}")
+            0x01 => DecodeLogin(content, serialNo, packet.ServerReceivedUtc),
+            0x13 => DecodeHeartbeat(content, serialNo, packet.SessionImei, packet.ServerReceivedUtc, lastKnownDeviceTimestampUtc),
+            0x12 or 0x22 => DecodeLocation(protocolNo, content, packet.SessionImei, packet.ServerReceivedUtc, lastKnownDeviceTimestampUtc),
+            0x16 or 0x26 => DecodeAlarm(content, serialNo, packet.SessionImei, packet.ServerReceivedUtc, lastKnownDeviceTimestampUtc),
+            0x15 or 0x21 => DecodeCommandResponse(protocolNo, content, packet.SessionImei, packet.ServerReceivedUtc),
+            0x8A => DecodeTimeSyncRequest(serialNo, packet.SessionImei, packet.ServerReceivedUtc),
+            _ => Fail($"Unsupported GT06 protocol number: 0x{protocolNo:X2}")
         };
     }
 
-    public byte[] BuildCommandPacket(string commandText, ushort serialNumber)
+    private static ProtocolDecodeResult DecodeLogin(
+        ReadOnlySpan<byte> content,
+        ushort serialNo,
+        DateTimeOffset serverNowUtc)
     {
-        byte[] cmdBytes = Encoding.ASCII.GetBytes(commandText);
-        byte contentLength = (byte)(4 + cmdBytes.Length); // 4-byte server flag + ASCII command
-        byte packetLength = (byte)(1 + 1 + contentLength + 2 + 2); // Proto(1) + CmdLen(1) + Content + Serial(2) + CRC(2)
-
-        byte[] buffer = new byte[2 + 1 + packetLength + 2];
-        buffer[0] = 0x78;
-        buffer[1] = 0x78;
-        buffer[2] = packetLength;
-        buffer[3] = 0x80;
-        buffer[4] = contentLength;
-
-        // Server flag (0x00000001)
-        BinaryPrimitives.WriteUInt32BigEndian(buffer.AsSpan(5, 4), 1u);
-        cmdBytes.CopyTo(buffer.AsSpan(9));
-
-        int serialOffset = 9 + cmdBytes.Length;
-        BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(serialOffset, 2), serialNumber);
-
-        ushort crc = CrcItu.Compute(buffer.AsSpan(2, serialOffset));
-        BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(serialOffset + 2, 2), crc);
-
-        buffer[^2] = 0x0D;
-        buffer[^1] = 0x0A;
-        return buffer;
-    }
-
-    public static byte[] BuildStandardAck(byte protocolNumber, ushort serialNumber)
-    {
-        byte[] ack = new byte[10];
-        ack[0] = 0x78;
-        ack[1] = 0x78;
-        ack[2] = 0x05;
-        ack[3] = protocolNumber;
-        BinaryPrimitives.WriteUInt16BigEndian(ack.AsSpan(4, 2), serialNumber);
-        ushort crc = CrcItu.Compute(ack.AsSpan(2, 4));
-        BinaryPrimitives.WriteUInt16BigEndian(ack.AsSpan(6, 2), crc);
-        ack[8] = 0x0D;
-        ack[9] = 0x0A;
-        return ack;
-    }
-
-    private ProtocolDecodeResult DecodeLogin(ReadOnlySpan<byte> payload, ushort serialNumber, DateTimeOffset serverNowUtc)
-    {
-        if (payload.Length < 8)
+        if (content.Length < 8)
         {
-            return ProtocolDecodeResult.Fail("Login payload too short");
+            return Fail("Login payload too short (< 8 BCD bytes).");
         }
 
-        var sb = new StringBuilder(16);
-        for (int i = 0; i < 8; i++)
-        {
-            sb.Append((payload[i] >> 4) & 0x0F);
-            sb.Append(payload[i] & 0x0F);
-        }
-
-        string imei = sb.ToString();
-        if (imei.Length == 16 && imei[0] == '0')
-        {
-            imei = imei[1..];
-        }
+        string imei = DecodeBcdImei(content.Slice(0, 8));
+        var ack = BuildStandardAck(0x01, serialNo);
 
         var telemetry = new NormalizedTelemetry(
-            Protocol: ProtocolName,
             Imei: imei,
-            PacketType: 0x01,
+            ProtocolName: ProtocolId,
+            PacketType: TelemetryPacketType.NonPersistedControl,
             DeviceTimestampUtc: serverNowUtc,
             ServerReceivedUtc: serverNowUtc,
             Latitude: null,
             Longitude: null,
-            LocationSource: "GPS",
-            AccuracyM: 0,
+            LocationSource: "NONE",
+            AccuracyMeters: 0,
             SpeedKmh: 0,
             Course: 0,
             Satellites: 0,
             IsGpsValid: false,
             Ignition: null,
             MainPowerConnected: null,
+            IsRelayCutActive: null,
             BatteryPercent: null,
             ExternalVoltage: null,
             GsmSignal: null,
             AlarmCode: null,
+            IsLate: false,
+            IsOutOfOrder: false,
             IsHistoricalReplay: false,
             IsClockSkewed: false);
 
-        return new ProtocolDecodeResult(
-            IsSuccess: true,
-            ErrorReason: null,
-            ResolvedImei: imei,
-            Telemetry: telemetry,
-            AckResponseBytes: BuildStandardAck(0x01, serialNumber));
+        return new ProtocolDecodeResult(true, null, telemetry, ack, ExtractedLoginImei: imei);
     }
 
-    private ProtocolDecodeResult DecodeHeartbeat(
-        ReadOnlySpan<byte> payload,
+    private static ProtocolDecodeResult DecodeHeartbeat(
+        ReadOnlySpan<byte> content,
+        ushort serialNo,
         string? sessionImei,
-        ushort serialNumber,
-        DateTimeOffset serverNowUtc)
+        DateTimeOffset serverNowUtc,
+        DateTimeOffset? lastKnownDeviceUtc)
     {
         if (string.IsNullOrWhiteSpace(sessionImei))
         {
-            return ProtocolDecodeResult.Fail("Heartbeat received before login IMEI binding");
+            return Fail("Heartbeat received on unauthenticated session.");
         }
 
-        if (payload.Length < 3)
+        if (content.Length < 3)
         {
-            return ProtocolDecodeResult.Fail("Heartbeat payload too short");
+            return Fail("Heartbeat payload too short (< 3 bytes).");
         }
 
-        byte terminalInfo = payload[0];
-        byte voltageLevel = payload[1];
-        byte gsmSignal = payload[2];
+        byte terminalInfo = content[0];
+        byte voltageLevel = content[1];
+        byte gsmSignal = content[2];
 
+        // Bug #3 Fix: GT06 Terminal Information bit definitions:
+        // Bit 7 (0b1000_0000): 1 = Oil/Electricity disconnected (Relay Cut Active), 0 = Connected
+        // Bit 6 (0b0100_0000): 1 = GPS tracking is on
+        // Bit 2 (0b0000_0100): 1 = Charging ON (External Main Power Connected), 0 = Running on backup battery
+        // Bit 1 (0b0000_0010): 1 = ACC High (Ignition ON), 0 = ACC Low
+        bool isRelayCut = (terminalInfo & 0b1000_0000) != 0;
+        bool mainPowerConnected = (terminalInfo & 0b0000_0100) != 0;
         bool ignition = (terminalInfo & 0b0000_0010) != 0;
-        bool mainPowerConnected = (terminalInfo & 0b0100_0000) == 0; // Bit 6 or 7 low means main power normal; in GT06 bit 2..0: bit 1=ACC, bit 7=Oil/Elec
-        int alarmBits = (terminalInfo >> 3) & 0b0000_0111;
-        string? alarmCode = alarmBits switch
-        {
-            1 => "VIBRATION",
-            2 => "POWER_CUT",
-            3 => "LOW_BATTERY",
-            4 => "SOS",
-            _ => null
-        };
 
-        if (alarmCode == "POWER_CUT")
-        {
-            mainPowerConnected = false;
-        }
+        short batteryPercent = MapVoltageLevelToPercent(voltageLevel);
+        bool isOutOfOrder = lastKnownDeviceUtc.HasValue && serverNowUtc <= lastKnownDeviceUtc.Value;
 
-        short batteryPercent = voltageLevel switch
-        {
-            0 => 0,
-            1 => 10,
-            2 => 25,
-            3 => 50,
-            4 => 75,
-            5 => 90,
-            _ => 100
-        };
+        var ack = BuildStandardAck(0x13, serialNo);
 
         var telemetry = new NormalizedTelemetry(
-            Protocol: ProtocolName,
             Imei: sessionImei,
-            PacketType: 0x13,
+            ProtocolName: ProtocolId,
+            PacketType: TelemetryPacketType.Heartbeat,
             DeviceTimestampUtc: serverNowUtc,
             ServerReceivedUtc: serverNowUtc,
             Latitude: null,
             Longitude: null,
-            LocationSource: "GPS",
-            AccuracyM: 0,
+            LocationSource: "NONE",
+            AccuracyMeters: 0,
             SpeedKmh: 0,
             Course: 0,
             Satellites: 0,
-            IsGpsValid: (terminalInfo & 0b0100_0000) != 0,
+            IsGpsValid: false,
             Ignition: ignition,
             MainPowerConnected: mainPowerConnected,
+            IsRelayCutActive: isRelayCut,
             BatteryPercent: batteryPercent,
             ExternalVoltage: null,
             GsmSignal: gsmSignal,
-            AlarmCode: alarmCode,
-            IsHistoricalReplay: false,
+            AlarmCode: !mainPowerConnected ? "alert.device.power_disconnected" : null,
+            IsLate: false,
+            IsOutOfOrder: isOutOfOrder,
+            IsHistoricalReplay: isOutOfOrder,
             IsClockSkewed: false);
 
-        return new ProtocolDecodeResult(
-            IsSuccess: true,
-            ErrorReason: null,
-            ResolvedImei: sessionImei,
-            Telemetry: telemetry,
-            AckResponseBytes: BuildStandardAck(0x13, serialNumber));
+        return new ProtocolDecodeResult(true, null, telemetry, ack);
     }
 
-    private ProtocolDecodeResult DecodeLocation(
-        byte protocolNumber,
-        ReadOnlySpan<byte> payload,
+    private static ProtocolDecodeResult DecodeLocation(
+        byte protocolNo,
+        ReadOnlySpan<byte> content,
         string? sessionImei,
         DateTimeOffset serverNowUtc,
-        DateTimeOffset? lastKnownTimestampUtc)
+        DateTimeOffset? lastKnownDeviceUtc)
     {
         if (string.IsNullOrWhiteSpace(sessionImei))
         {
-            return ProtocolDecodeResult.Fail("Location packet received before login IMEI binding");
+            return Fail("Location packet received on unauthenticated session.");
         }
 
-        if (payload.Length < 18)
+        if (content.Length < 18)
         {
-            return ProtocolDecodeResult.Fail("Location payload too short");
+            return Fail("Location payload too short (< 18 bytes).");
         }
 
-        var (deviceTimeUtc, isSkewed, isReplay) = ParseTimestamp(payload[..6], serverNowUtc, lastKnownTimestampUtc);
-        short satellites = (short)(payload[6] & 0x0F);
+        var (deviceUtc, isSkewed, isLate, isOutOfOrder) = ParseDeviceTimestamp(
+            content.Slice(0, 6), serverNowUtc, lastKnownDeviceUtc);
 
-        double rawLat = BinaryPrimitives.ReadUInt32BigEndian(payload.Slice(7, 4)) / 1800000.0;
-        double rawLon = BinaryPrimitives.ReadUInt32BigEndian(payload.Slice(11, 4)) / 1800000.0;
-        float speedKmh = payload[15];
-        ushort courseAndStatus = BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(16, 2));
+        byte satByte = content[6];
+        short satellites = (short)(satByte & 0x0F);
 
-        bool isGpsValid = (courseAndStatus & (1 << 12)) != 0;
-        bool isWest = (courseAndStatus & (1 << 11)) != 0;
-        bool isNorth = (courseAndStatus & (1 << 10)) != 0;
-        short course = (short)(courseAndStatus & 0x03FF);
+        uint rawLat = BinaryPrimitives.ReadUInt32BigEndian(content.Slice(7, 4));
+        uint rawLon = BinaryPrimitives.ReadUInt32BigEndian(content.Slice(11, 4));
+        byte speedKmh = content[15];
+        ushort courseStatus = BinaryPrimitives.ReadUInt16BigEndian(content.Slice(16, 2));
 
-        double latitude = isNorth ? rawLat : -rawLat;
-        double longitude = isWest ? -rawLon : rawLon;
+        bool isGpsPositioned = (courseStatus & 0x1000) != 0;
+        bool isWest = (courseStatus & 0x0800) != 0;
+        bool isNorth = (courseStatus & 0x0400) != 0;
+        short course = (short)(courseStatus & 0x03FF);
 
-        bool? ignition = payload.Length >= 27 ? payload[26] != 0 : null;
+        double lat = rawLat / 1800000.0;
+        double lon = rawLon / 1800000.0;
+        if (!isNorth) lat = -lat;
+        if (isWest) lon = -lon;
 
+        // Optional ACC byte in 0x22 4G packets (after 8-byte LBS block at index 18..25)
+        bool? ignition = null;
+        if (protocolNo == 0x22 && content.Length >= 27)
+        {
+            ignition = content[26] != 0x00;
+        }
+
+        bool isGpsValid = isGpsPositioned && satellites >= 3;
+
+        // Bug #4 Fix: MainPowerConnected is strictly null on Location packets so it never overwrites a PowerCut state
         var telemetry = new NormalizedTelemetry(
-            Protocol: ProtocolName,
             Imei: sessionImei,
-            PacketType: protocolNumber,
-            DeviceTimestampUtc: deviceTimeUtc,
+            ProtocolName: ProtocolId,
+            PacketType: TelemetryPacketType.Location,
+            DeviceTimestampUtc: deviceUtc,
             ServerReceivedUtc: serverNowUtc,
-            Latitude: Math.Round(latitude, 6),
-            Longitude: Math.Round(longitude, 6),
+            Latitude: lat,
+            Longitude: lon,
             LocationSource: isGpsValid ? "GPS" : "LBS",
-            AccuracyM: isGpsValid ? (short)10 : (short)500,
+            AccuracyMeters: isGpsValid ? (short)10 : (short)800,
             SpeedKmh: speedKmh,
             Course: course,
             Satellites: satellites,
             IsGpsValid: isGpsValid,
             Ignition: ignition,
-            MainPowerConnected: true,
+            MainPowerConnected: null,
+            IsRelayCutActive: null,
             BatteryPercent: null,
             ExternalVoltage: null,
             GsmSignal: null,
             AlarmCode: null,
-            IsHistoricalReplay: isReplay,
+            IsLate: isLate,
+            IsOutOfOrder: isOutOfOrder,
+            IsHistoricalReplay: isLate || isOutOfOrder,
             IsClockSkewed: isSkewed);
 
-        return new ProtocolDecodeResult(
-            IsSuccess: true,
-            ErrorReason: null,
-            ResolvedImei: sessionImei,
-            Telemetry: telemetry,
-            AckResponseBytes: null);
+        return new ProtocolDecodeResult(true, null, telemetry, ImmediateAckFrame: null);
     }
 
-    private ProtocolDecodeResult DecodeAlarm(
-        byte protocolNumber,
-        ReadOnlySpan<byte> payload,
+    private static ProtocolDecodeResult DecodeAlarm(
+        ReadOnlySpan<byte> content,
+        ushort serialNo,
         string? sessionImei,
-        ushort serialNumber,
         DateTimeOffset serverNowUtc,
-        DateTimeOffset? lastKnownTimestampUtc)
+        DateTimeOffset? lastKnownDeviceUtc)
     {
-        var locResult = DecodeLocation(protocolNumber, payload, sessionImei, serverNowUtc, lastKnownTimestampUtc);
-        if (!locResult.IsSuccess || locResult.Telemetry is null)
+        if (string.IsNullOrWhiteSpace(sessionImei))
         {
-            return locResult;
+            return Fail("Alarm packet received on unauthenticated session.");
         }
 
-        // In GT06 0x16/0x26 alarm packets, after 18 bytes GPS + 9 bytes LBS (total 27 bytes), terminal info & alarm code follow
-        bool? ignition = locResult.Telemetry.Ignition;
-        bool mainPower = true;
-        short? batteryPct = null;
-        short? gsm = null;
-        string? alarmCode = "UNKNOWN_ALARM";
-
-        if (payload.Length >= 31)
+        // 0x16 layout: 6B DateTime + 12B GPS + 9B LBS (1B len + 8B LBS) + 5B TerminalStatus/Alarm = 32 bytes min
+        if (content.Length < 31)
         {
-            byte terminalInfo = payload[27];
-            byte voltageLevel = payload[28];
-            byte gsmSignal = payload[29];
-            byte alarmByte = payload[30];
-
-            ignition = (terminalInfo & 0b0000_0010) != 0;
-            gsm = gsmSignal;
-            batteryPct = voltageLevel switch
-            {
-                0 => 0,
-                1 => 10,
-                2 => 25,
-                3 => 50,
-                4 => 75,
-                5 => 90,
-                _ => 100
-            };
-
-            alarmCode = alarmByte switch
-            {
-                0x01 => "SOS",
-                0x02 => "POWER_CUT",
-                0x03 => "VIBRATION",
-                0x04 => "GEOFENCE_ENTER",
-                0x05 => "GEOFENCE_EXIT",
-                0x06 => "OVERSPEED",
-                0x09 => "MOVING",
-                0xFE => "ACC_ON",
-                0xFF => "ACC_OFF",
-                _ => $"ALARM_0x{alarmByte:X2}"
-            };
-
-            if (alarmCode == "POWER_CUT")
-            {
-                mainPower = false;
-            }
+            return Fail("Alarm payload too short.");
         }
 
-        var alarmTelemetry = locResult.Telemetry with
-        {
-            Ignition = ignition,
-            MainPowerConnected = mainPower,
-            BatteryPercent = batteryPct,
-            GsmSignal = gsm,
-            AlarmCode = alarmCode
-        };
+        var (deviceUtc, isSkewed, isLate, isOutOfOrder) = ParseDeviceTimestamp(
+            content.Slice(0, 6), serverNowUtc, lastKnownDeviceUtc);
 
-        return new ProtocolDecodeResult(
-            IsSuccess: true,
-            ErrorReason: null,
-            ResolvedImei: sessionImei,
-            Telemetry: alarmTelemetry,
-            AckResponseBytes: BuildStandardAck(protocolNumber, serialNumber));
+        byte satByte = content[6];
+        short satellites = (short)(satByte & 0x0F);
+
+        uint rawLat = BinaryPrimitives.ReadUInt32BigEndian(content.Slice(7, 4));
+        uint rawLon = BinaryPrimitives.ReadUInt32BigEndian(content.Slice(11, 4));
+        byte speedKmh = content[15];
+        ushort courseStatus = BinaryPrimitives.ReadUInt16BigEndian(content.Slice(16, 2));
+
+        bool isGpsPositioned = (courseStatus & 0x1000) != 0;
+        bool isWest = (courseStatus & 0x0800) != 0;
+        bool isNorth = (courseStatus & 0x0400) != 0;
+        short course = (short)(courseStatus & 0x03FF);
+
+        double lat = rawLat / 1800000.0;
+        double lon = rawLon / 1800000.0;
+        if (!isNorth) lat = -lat;
+        if (isWest) lon = -lon;
+
+        // Status block is located in the last 5 bytes of 0x16 content:
+        // [TerminalInfo, VoltageLevel, GsmSignal, AlarmType, Language]
+        int statusOffset = content.Length - 5;
+        byte terminalInfo = content[statusOffset];
+        byte voltageLevel = content[statusOffset + 1];
+        byte gsmSignal = content[statusOffset + 2];
+        byte alarmByte = content[statusOffset + 3];
+
+        // Bug #3 Fix: Decode terminalInfo bits & alarmByte accurately
+        bool isRelayCut = (terminalInfo & 0b1000_0000) != 0;
+        bool mainPowerConnected = (terminalInfo & 0b0000_0100) != 0;
+        bool ignition = (terminalInfo & 0b0000_0010) != 0;
+
+        byte terminalAlarmBits = (byte)((terminalInfo >> 3) & 0b0000_0111);
+        string alarmCode = MapAlarmCode(alarmByte, terminalAlarmBits);
+
+        if (alarmCode == "alert.device.power_cut")
+        {
+            mainPowerConnected = false;
+        }
+
+        bool isGpsValid = isGpsPositioned && satellites >= 3;
+        var ack = BuildStandardAck(0x16, serialNo);
+
+        var telemetry = new NormalizedTelemetry(
+            Imei: sessionImei,
+            ProtocolName: ProtocolId,
+            PacketType: TelemetryPacketType.Alarm,
+            DeviceTimestampUtc: deviceUtc,
+            ServerReceivedUtc: serverNowUtc,
+            Latitude: lat,
+            Longitude: lon,
+            LocationSource: isGpsValid ? "GPS" : "LBS",
+            AccuracyMeters: isGpsValid ? (short)10 : (short)800,
+            SpeedKmh: speedKmh,
+            Course: course,
+            Satellites: satellites,
+            IsGpsValid: isGpsValid,
+            Ignition: ignition,
+            MainPowerConnected: mainPowerConnected,
+            IsRelayCutActive: isRelayCut,
+            BatteryPercent: MapVoltageLevelToPercent(voltageLevel),
+            ExternalVoltage: null,
+            GsmSignal: gsmSignal,
+            AlarmCode: alarmCode,
+            IsLate: isLate,
+            IsOutOfOrder: isOutOfOrder,
+            IsHistoricalReplay: isLate || isOutOfOrder,
+            IsClockSkewed: isSkewed);
+
+        return new ProtocolDecodeResult(true, null, telemetry, ack);
     }
 
-    private ProtocolDecodeResult DecodeCommandResponse(
-        byte protocolNumber,
-        ReadOnlySpan<byte> payload,
+    private static ProtocolDecodeResult DecodeCommandResponse(
+        byte protocolNo,
+        ReadOnlySpan<byte> content,
         string? sessionImei,
         DateTimeOffset serverNowUtc)
     {
         if (string.IsNullOrWhiteSpace(sessionImei))
         {
-            return ProtocolDecodeResult.Fail("Command response received before login IMEI binding");
+            return Fail("Command ACK received on unauthenticated session.");
         }
 
-        if (payload.Length < 5)
+        if (content.Length < 5)
         {
-            return ProtocolDecodeResult.Fail("Command response payload too short");
+            return Fail("Command response payload too short.");
         }
 
-        // Payload: [CmdLength(1)] [ServerFlag(4)] [ASCII Text...] [Language(2 optional)]
-        int textOffset = 5;
-        int textLen = payload.Length - textOffset;
-        if (textLen >= 2 && payload[^2] == 0x00 && (payload[^1] == 0x01 || payload[^1] == 0x02))
+        int textOffset = protocolNo == 0x21 ? 6 : 5;
+        if (content.Length < textOffset)
         {
-            textLen -= 2;
+            textOffset = 5;
         }
 
-        string responseText = textLen > 0
-            ? Encoding.ASCII.GetString(payload.Slice(textOffset, textLen)).Trim()
-            : string.Empty;
+        int textLen = Math.Max(0, content.Length - textOffset);
+        if (textLen >= 2 && content[^2] == 0x00 && content[^1] <= 0x02)
+        {
+            textLen -= 2; // Strip trailing 2-byte language indicator if present
+        }
+
+        string responseText = Encoding.ASCII.GetString(content.Slice(textOffset, textLen)).Trim('\0', ' ');
 
         var telemetry = new NormalizedTelemetry(
-            Protocol: ProtocolName,
             Imei: sessionImei,
-            PacketType: protocolNumber,
+            ProtocolName: ProtocolId,
+            PacketType: TelemetryPacketType.NonPersistedControl,
             DeviceTimestampUtc: serverNowUtc,
             ServerReceivedUtc: serverNowUtc,
             Latitude: null,
             Longitude: null,
-            LocationSource: "GPS",
-            AccuracyM: 0,
+            LocationSource: "NONE",
+            AccuracyMeters: 0,
             SpeedKmh: 0,
             Course: 0,
             Satellites: 0,
             IsGpsValid: false,
             Ignition: null,
             MainPowerConnected: null,
+            IsRelayCutActive: null,
             BatteryPercent: null,
             ExternalVoltage: null,
             GsmSignal: null,
             AlarmCode: null,
+            IsLate: false,
+            IsOutOfOrder: false,
             IsHistoricalReplay: false,
             IsClockSkewed: false,
             CommandResponseText: responseText);
 
-        return new ProtocolDecodeResult(
-            IsSuccess: true,
-            ErrorReason: null,
-            ResolvedImei: sessionImei,
-            Telemetry: telemetry,
-            AckResponseBytes: null);
+        return new ProtocolDecodeResult(true, null, telemetry, ImmediateAckFrame: null);
     }
 
-    private static (DateTimeOffset TimestampUtc, bool IsClockSkewed, bool IsHistoricalReplay) ParseTimestamp(
+    private static ProtocolDecodeResult DecodeTimeSyncRequest(
+        ushort serialNo,
+        string? sessionImei,
+        DateTimeOffset serverNowUtc)
+    {
+        var utc = serverNowUtc.UtcDateTime;
+        Span<byte> frame = stackalloc byte[16];
+        frame[0] = 0x78;
+        frame[1] = 0x78;
+        frame[2] = 0x0B; // Length: 1(Proto) + 6(DateTime) + 2(Serial) + 2(CRC) = 11
+        frame[3] = 0x8A;
+        frame[4] = (byte)(utc.Year - 2000);
+        frame[5] = (byte)utc.Month;
+        frame[6] = (byte)utc.Day;
+        frame[7] = (byte)utc.Hour;
+        frame[8] = (byte)utc.Minute;
+        frame[9] = (byte)utc.Second;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(10, 2), serialNo);
+        ushort crc = CrcItu.Compute(frame.Slice(2, 10));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(12, 2), crc);
+        frame[14] = 0x0D;
+        frame[15] = 0x0A;
+
+        var telemetry = new NormalizedTelemetry(
+            Imei: sessionImei ?? "UNKNOWN",
+            ProtocolName: ProtocolId,
+            PacketType: TelemetryPacketType.NonPersistedControl,
+            DeviceTimestampUtc: serverNowUtc,
+            ServerReceivedUtc: serverNowUtc,
+            Latitude: null,
+            Longitude: null,
+            LocationSource: "NONE",
+            AccuracyMeters: 0,
+            SpeedKmh: 0,
+            Course: 0,
+            Satellites: 0,
+            IsGpsValid: false,
+            Ignition: null,
+            MainPowerConnected: null,
+            IsRelayCutActive: null,
+            BatteryPercent: null,
+            ExternalVoltage: null,
+            GsmSignal: null,
+            AlarmCode: null,
+            IsLate: false,
+            IsOutOfOrder: false,
+            IsHistoricalReplay: false,
+            IsClockSkewed: false);
+
+        return new ProtocolDecodeResult(true, null, telemetry, frame.ToArray());
+    }
+
+    /// <summary>
+    /// Fixes Bug #1 (future-only clock skew + separate IsLate/IsOutOfOrder flags)
+    /// and Bug #2 (DateTime.DaysInMonth validation preventing Feb 31 crashes).
+    /// </summary>
+    private static (DateTimeOffset EffectiveUtc, bool IsClockSkewed, bool IsLate, bool IsOutOfOrder) ParseDeviceTimestamp(
         ReadOnlySpan<byte> b,
         DateTimeOffset serverNowUtc,
-        DateTimeOffset? lastKnownTimestampUtc)
+        DateTimeOffset? lastKnownDeviceUtc)
     {
         int year = 2000 + b[0];
-        int month = Math.Clamp((int)b[1], 1, 12);
-        int day = Math.Clamp((int)b[2], 1, 31);
-        int hour = Math.Clamp((int)b[3], 0, 23);
-        int minute = Math.Clamp((int)b[4], 0, 59);
-        int second = Math.Clamp((int)b[5], 0, 59);
+        int month = b[1];
+        int day = b[2];
+        int hour = b[3];
+        int minute = b[4];
+        int second = b[5];
+
+        // Bug #2 Fix: Validate calendar boundaries before constructing DateTimeOffset
+        if (year < 2000 || year > 2100 ||
+            month < 1 || month > 12 ||
+            day < 1 || day > DateTime.DaysInMonth(year, month) ||
+            hour > 23 || minute > 59 || second > 59)
+        {
+            bool skewedOutOfOrder = lastKnownDeviceUtc.HasValue && serverNowUtc <= lastKnownDeviceUtc.Value;
+            return (serverNowUtc, IsClockSkewed: true, IsLate: false, IsOutOfOrder: skewedOutOfOrder);
+        }
 
         var rawUtc = new DateTimeOffset(year, month, day, hour, minute, second, TimeSpan.Zero);
-        bool isSkewed = (rawUtc - serverNowUtc).Duration() > MaxClockSkew;
-        DateTimeOffset effectiveUtc = isSkewed ? serverNowUtc : rawUtc;
-        bool isReplay = lastKnownTimestampUtc.HasValue && effectiveUtc < lastKnownTimestampUtc.Value;
 
-        return (effectiveUtc, isSkewed, isReplay);
+        // Bug #1 Fix (Spec I3): Clock skew applies ONLY to future timestamps (> ServerUtc + 5 mins).
+        // Past buffered packets MUST keep their original device timestamp!
+        if (rawUtc > serverNowUtc + MaxFutureClockSkew)
+        {
+            bool futureOutOfOrder = lastKnownDeviceUtc.HasValue && serverNowUtc <= lastKnownDeviceUtc.Value;
+            return (serverNowUtc, IsClockSkewed: true, IsLate: false, IsOutOfOrder: futureOutOfOrder);
+        }
+
+        bool isLate = (serverNowUtc - rawUtc) > LatePacketThreshold;
+        bool isOutOfOrder = lastKnownDeviceUtc.HasValue && rawUtc <= lastKnownDeviceUtc.Value;
+
+        return (rawUtc, IsClockSkewed: false, IsLate: isLate, IsOutOfOrder: isOutOfOrder);
     }
+
+    private static string MapAlarmCode(byte alarmByte, byte terminalAlarmBits)
+    {
+        byte effective = alarmByte != 0 ? alarmByte : terminalAlarmBits;
+        return effective switch
+        {
+            0x01 => "alert.device.sos",
+            0x02 => "alert.device.power_cut",
+            0x03 => "alert.device.vibration",
+            0x04 => "alert.geofence.enter",
+            0x05 => "alert.geofence.exit",
+            0x06 => "alert.vehicle.overspeed",
+            0x09 or 0x0E or 0x13 => "alert.device.displacement_or_tamper",
+            _ => "alert.device.generic_alarm"
+        };
+    }
+
+    private static short MapVoltageLevelToPercent(byte level) => level switch
+    {
+        0 => 0,
+        1 => 10,
+        2 => 25,
+        3 => 50,
+        4 => 75,
+        5 => 90,
+        >= 6 => 100
+    };
+
+    private static string DecodeBcdImei(ReadOnlySpan<byte> bcd)
+    {
+        Span<char> chars = stackalloc char[16];
+        for (int i = 0; i < 8; i++)
+        {
+            chars[i * 2] = (char)('0' + ((bcd[i] >> 4) & 0x0F));
+            chars[i * 2 + 1] = (char)('0' + (bcd[i] & 0x0F));
+        }
+
+        // Standard 15-digit IMEI is padded with a leading '0' in 8-byte GT06 BCD
+        return chars[0] == '0'
+            ? new string(chars.Slice(1, 15))
+            : new string(chars.Slice(0, 15));
+    }
+
+    public static byte[] BuildStandardAck(byte protocolNo, ushort serialNo)
+    {
+        Span<byte> frame = stackalloc byte[10];
+        frame[0] = 0x78;
+        frame[1] = 0x78;
+        frame[2] = 0x05;
+        frame[3] = protocolNo;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(4, 2), serialNo);
+        ushort crc = CrcItu.Compute(frame.Slice(2, 4));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(6, 2), crc);
+        frame[8] = 0x0D;
+        frame[9] = 0x0A;
+        return frame.ToArray();
+    }
+
+    public static byte[] BuildServerCommandFrame(string asciiCommand, ushort serialNo, uint serverFlag = 1)
+    {
+        byte[] cmdBytes = Encoding.ASCII.GetBytes(asciiCommand);
+        int commandLengthField = 4 + cmdBytes.Length; // 4B ServerFlag + ASCII command
+        int packetLengthField = 1 + 1 + commandLengthField + 2 + 2; // Proto(1) + CmdLen(1) + CmdContent + Serial(2) + CRC(2)
+
+        byte[] frame = new byte[2 + 1 + packetLengthField + 2];
+        frame[0] = 0x78;
+        frame[1] = 0x78;
+        frame[2] = (byte)packetLengthField;
+        frame[3] = 0x80;
+        frame[4] = (byte)commandLengthField;
+        BinaryPrimitives.WriteUInt32BigEndian(frame.AsSpan(5, 4), serverFlag);
+        cmdBytes.CopyTo(frame.AsSpan(9));
+
+        int serialOffset = 9 + cmdBytes.Length;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(serialOffset, 2), serialNo);
+
+        ushort crc = CrcItu.Compute(frame.AsSpan(2, serialOffset));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(serialOffset + 2, 2), crc);
+
+        frame[^2] = 0x0D;
+        frame[^1] = 0x0A;
+        return frame;
+    }
+
+    private static ProtocolDecodeResult Fail(string reason) =>
+        new(false, reason, null, null);
 }
